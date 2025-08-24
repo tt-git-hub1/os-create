@@ -1,0 +1,187 @@
+#####################################
+# 1. 環境変数
+#####################################
+
+export ENV="inf"
+export PROJECT="kish-code"
+export PRAEFECT_LAUNCH_TEMPLATE_NAME="${ENV}-${PROJECT}-git-praefect"
+export PRAEFECT_ASG_NAME="${ENV}-${PROJECT}-git-praefect"
+export PRAEFECT_TARGET_GROUP_NAME="${ENV}-${PROJECT}-praefect-tg"
+export ENV=$ENV | tee -a PRAEFECT_VAR_ENV.env
+export PROJECT=${PROJECT} | tee -a PRAEFECT_VAR_ENV.env
+export PRAEFECT_LAUNCH_TEMPLATE_NAME=$PRAEFECT_LAUNCH_TEMPLATE_NAME | tee -a PRAEFECT_VAR_ENV.env
+export PRAEFECT_ASG_NAME=$PRAEFECT_ASG_NAME | tee -a PRAEFECT_VAR_ENV.env
+export PRAEFECT_TARGET_GROUP_NAME=$PRAEFECT_TARGET_GROUP_NAME | tee -a PRAEFECT_VAR_ENV.env
+
+source PRAEFECT_VAR_ENV.env
+echo PRAEFECT_LAUNCH_TEMPLATE_NAME=$PRAEFECT_LAUNCH_TEMPLATE_NAME
+echo PRAEFECT_LAUNCH_TEMPLATE_ID=$PRAEFECT_LAUNCH_TEMPLATE_ID
+echo PRAEFECT_ASG_NAME=$PRAEFECT_ASG_NAME
+echo BLUE_PRAEFECT_LAUNCH_TEMPLATE_VERSION=$BLUE_PRAEFECT_LAUNCH_TEMPLATE_VERSION
+
+
+#####################################
+# 2. 起動テンプレートのアップデート
+#####################################
+#旧OSの起動テンプレートのUserDataを取得
+BLUE_PRAEFECT_LAUNCH_TEMPLATE_JSON=$(aws ec2 describe-launch-template-versions \
+  --launch-template-id $PRAEFECT_LAUNCH_TEMPLATE_ID \
+  --versions $BLUE_PRAEFECT_LAUNCH_TEMPLATE_VERSION \
+  --query 'LaunchTemplateVersions[0].LaunchTemplateData.{ImageId:ImageId, UserData:UserData}' \
+  --output json | jq '@json')
+echo BLUE_PRAEFECT_LAUNCH_TEMPLATE_JSON=$BLUE_PRAEFECT_LAUNCH_TEMPLATE_JSON | tee -a PRAEFECT_VAR_ENV.env
+
+#起動テンプレートのAMIとUserDataを変数化
+BLUE_PRAEFECT_LAUNCH_TEMPLATE_AMI=$(echo $BLUE_PRAEFECT_LAUNCH_TEMPLATE_JSON | jq '. | fromjson' | jq -r .ImageId)
+BLUE_PRAEFECT_LAUNCH_TEMPLATE_USER_DATA=$(echo $BLUE_PRAEFECT_LAUNCH_TEMPLATE_JSON | jq '. | fromjson' | jq -r .UserData)
+
+echo BLUE_PRAEFECT_LAUNCH_TEMPLATE_AMI=$BLUE_PRAEFECT_LAUNCH_TEMPLATE_AMI | tee -a PRAEFECT_VAR_ENV.env
+echo BLUE_PRAEFECT_LAUNCH_TEMPLATE_USER_DATA=$BLUE_PRAEFECT_LAUNCH_TEMPLATE_USER_DATA | tee -a PRAEFECT_VAR_ENV.env
+
+#旧OSのUserDataのデコード結果をファイルに出力
+echo $BLUE_PRAEFECT_LAUNCH_TEMPLATE_USER_DATA | base64 -d > blue_praefect_user_data_decode.txt
+cat blue_praefect_user_data_decode.txt
+
+#DBスキーマ変更を無効化設定を追加
+sed -i -e "s#\(^prometheus\[.*\)#\1\npraefect['auto_migrate'] = false#g" blue_praefect_user_data_decode.txt
+
+#修正した結果を表示
+cat blue_praefect_user_data_decode.txt
+
+#置換後のUserDataをエンコード
+BLUE_USER_DATA_ENCODE_UPDATE=$(cat blue_praefect_user_data_decode.txt | base64 -w 0)
+
+#変更内容JSON
+BLUE_TEMPLATE=$(cat << EOF
+{
+  "UserData": "$BLUE_USER_DATA_ENCODE_UPDATE"
+}
+EOF
+)
+BLUE_LAUNCH_TEMPLATE_DATA=$(echo $BLUE_TEMPLATE | jq -c)
+echo $BLUE_LAUNCH_TEMPLATE_DATA
+
+#起動テンプレート差分更新実行
+aws ec2 create-launch-template-version \
+  --launch-template-id $PRAEFECT_LAUNCH_TEMPLATE_ID \
+  --version-description "OS Image back to AL2023 to AL2" \
+  --source-version $BLUE_PRAEFECT_LAUNCH_TEMPLATE_VERSION \
+  --launch-template-data "$BLUE_LAUNCH_TEMPLATE_DATA" \
+  --query "LaunchTemplateVersion.VersionNumber" \
+  --output text
+
+#更新後のPraefectの起動テンプレートを取得
+BLUE_LAUNCH_TEMPLATE_VERSION_JSON=$(aws ec2 describe-launch-templates \
+  --filters Name=launch-template-name,Values=${PRAEFECT_LAUNCH_TEMPLATE_NAME}* \
+  --query 'LaunchTemplates[0].{LaunchTemplateId:LaunchTemplateId, DefaultVersionNumber:DefaultVersionNumber, LatestVersionNumber:LatestVersionNumber}' \
+  --output json | jq '@json')
+echo BLUE_LAUNCH_TEMPLATE_VERSION_JSON=$BLUE_LAUNCH_TEMPLATE_VERSION_JSON | tee -a PRAEFECT_VAR_ENV.env
+
+BLUE_LAUNCH_TEMPLATE_LATEST_VERSION=$(echo $BLUE_LAUNCH_TEMPLATE_VERSION_JSON | jq '. | fromjson' | jq -r .LatestVersionNumber)
+echo BLUE_LAUNCH_TEMPLATE_LATEST_VERSION=$BLUE_LAUNCH_TEMPLATE_LATEST_VERSION
+
+#Praefectの起動テンプレートのデフォルトVersionを旧OSの起動テンプレートのVersionに設定
+aws ec2 modify-launch-template \
+  --launch-template-id $PRAEFECT_LAUNCH_TEMPLATE_ID \
+  --default-version $BLUE_LAUNCH_TEMPLATE_LATEST_VERSION
+
+#####################################
+# 3. 新規インスタンスの起動（A）
+#####################################
+#現行のAutoScalingGroupが使用するテンプレートVersionを確認する
+GREEN_ASG_TEMPLATE_VERSION=$(aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-name $PRAEFECT_ASG_NAME \
+  --query 'AutoScalingGroups[0].LaunchTemplate.Version' \
+  --output text)
+echo GREEN_ASG_TEMPLATE_VERSION=$GREEN_ASG_TEMPLATE_VERSION
+
+#AutoScalingGroupが使用するテンプレートVersionを旧OSの起動テンプレートのVersionに設定
+aws autoscaling update-auto-scaling-group \
+  --auto-scaling-group-name $PRAEFECT_ASG_NAME \
+  --launch-template LaunchTemplateId=$PRAEFECT_LAUNCH_TEMPLATE_ID,Version=$BLUE_LAUNCH_TEMPLATE_LATEST_VERSION
+
+#変更後のAutoScalingGroupが使用するテンプレートVersionを確認
+BLUE_ASG_TEMPLATE_VERSION=$(aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-name $PRAEFECT_ASG_NAME \
+  --query 'AutoScalingGroups[0].LaunchTemplate.Version' \
+  --output text)
+echo BLUE_ASG_TEMPLATE_VERSION=$BLUE_ASG_TEMPLATE_VERSION
+
+#スケールアウト実行前のインスタンス一覧確認
+ALL_ASG_INSTANCES_JSON=$(aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-name $PRAEFECT_ASG_NAME \
+  --query 'AutoScalingGroups[0].Instances[].{InstanceId:InstanceId, LifecycleState:LifecycleState, Version:LaunchTemplate.Version}' \
+  --output json | jq '@json')
+echo $ALL_ASG_INSTANCES_JSON | jq '. | fromjson'
+
+#スケールアウト実行（2倍に拡張）
+aws autoscaling update-auto-scaling-group \
+  --auto-scaling-group-name $PRAEFECT_ASG_NAME \
+  --desired-capacity 6 \
+  --max-size 6
+
+#新規インスタンス（旧OSのテンプレート）が、2倍に増え&稼働中（InService）になるまで待機
+ALL_ASG_INSTANCES_JSON=$(aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-name $PRAEFECT_ASG_NAME \
+  --query 'AutoScalingGroups[0].Instances[].{InstanceId:InstanceId, LifecycleState:LifecycleState, Version:LaunchTemplate.Version}' \
+  --output json | jq '@json')
+echo $ALL_ASG_INSTANCES_JSON | jq '. | fromjson'
+
+#Linux用
+BLUE_INSTANCE_IDS=($(echo $ALL_ASG_INSTANCES_JSON | jq '. | fromjson' | jq ".[] | select(.Version == \"$BLUE_LAUNCH_TEMPLATE_LATEST_VERSION\" and .LifecycleState == \"InService\")" | jq -r .InstanceId))
+#Windows用
+BLUE_INSTANCE_IDS=($(echo "$ALL_ASG_INSTANCES_JSON" | jq -r '. | fromjson | map(select(.Version == "'"$BLUE_LAUNCH_TEMPLATE_LATEST_VERSION"'" and .LifecycleState=="InService")) | .[].InstanceId' | tr -d '\r'))
+
+BLUE_INSTANCE_ID_0=${BLUE_INSTANCE_IDS[0]}
+BLUE_INSTANCE_ID_1=${BLUE_INSTANCE_IDS[1]}
+BLUE_INSTANCE_ID_2=${BLUE_INSTANCE_IDS[2]}
+echo BLUE_INSTANCE_ID_0=$BLUE_INSTANCE_ID_0
+echo BLUE_INSTANCE_ID_1=$BLUE_INSTANCE_ID_1
+echo BLUE_INSTANCE_ID_2=$BLUE_INSTANCE_ID_2
+
+BLUE_INSTANCES_JSON=$(aws ec2 describe-instances \
+  --instance-ids $BLUE_INSTANCE_ID_0 $BLUE_INSTANCE_ID_1 $BLUE_INSTANCE_ID_2 \
+  --query 'Reservations[].Instances[].{InstanceId:InstanceId, PrivateIpAddress:PrivateIpAddress}' \
+  --output json | jq '@json')
+echo $BLUE_INSTANCES_JSON | jq '. | fromjson'
+
+BLUE_INSTANCE_IP_0=$(echo $BLUE_INSTANCES_JSON | jq '. | fromjson' | jq -r '.[0].PrivateIpAddress')
+BLUE_INSTANCE_IP_1=$(echo $BLUE_INSTANCES_JSON | jq '. | fromjson' | jq -r '.[1].PrivateIpAddress')
+BLUE_INSTANCE_IP_2=$(echo $BLUE_INSTANCES_JSON | jq '. | fromjson' | jq -r '.[2].PrivateIpAddress')
+echo BLUE_INSTANCE_IP_0=$BLUE_INSTANCE_IP_0 | tee -a GITALY_VAR_ENV.env
+echo BLUE_INSTANCE_IP_1=$BLUE_INSTANCE_IP_1 | tee -a GITALY_VAR_ENV.env
+echo BLUE_INSTANCE_IP_2=$BLUE_INSTANCE_IP_2 | tee -a GITALY_VAR_ENV.env
+
+#PraefectロードバランサーのターゲットグループARN取得
+TG_ARN=$(aws elbv2 describe-target-groups \
+  --names $PRAEFECT_TARGET_GROUP_NAME \
+  --query TargetGroups[0].TargetGroupArn \
+  --output text)
+echo TG_ARN=$TG_ARN
+
+#ターゲットグループのHealthチェック状況の一覧表示
+aws elbv2 describe-target-health \
+  --target-group-arn $TG_ARN \
+  --query 'TargetHealthDescriptions[].{Id:Target.Id, HealthCheckPort:HealthCheckPort, State:TargetHealth.State}' \
+  --output json | jq .
+
+ssh -i ../opsman-dev.pem vcap@$BLUE_INSTANCE_IP_0
+sudo tail -f /var/log/cloud-init-output.log
+
+#####################################
+# 4. Greenインスタンス（旧Versionテンプレートのインスタンスの削除）
+#####################################
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-name $PRAEFECT_ASG_NAME \
+  --query 'AutoScalingGroups[0].Instances[].{InstanceId:InstanceId, LifecycleState:LifecycleState, Version:LaunchTemplate.Version}' \
+  --output json
+
+aws autoscaling update-auto-scaling-group \
+  --auto-scaling-group-name $PRAEFECT_ASG_NAME \
+  --desired-capacity 3 \
+  --max-size 3
+
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-name $PRAEFECT_ASG_NAME \
+  --query 'AutoScalingGroups[0].Instances[].{InstanceId:InstanceId, LifecycleState:LifecycleState, Version:LaunchTemplate.Version}' \
+  --output json
