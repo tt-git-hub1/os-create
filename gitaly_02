@@ -1,0 +1,232 @@
+#####################################
+# 1. 環境変数
+#####################################
+export ENV="inf"
+export PROJECT="kish-code"
+export PRAEFECT_LAUNCH_TEMPLATE_NAME="${ENV}-${PROJECT}-git-praefect"
+export PRAEFECT_ASG_NAME="${ENV}-${PROJECT}-git-praefect"
+export PRAEFECT_TARGET_GROUP_NAME="${ENV}-${PROJECT}-praefect-tg"
+export ENV=$ENV | tee -a PRAEFECT_VAR_ENV.env
+export PROJECT=${PROJECT} | tee -a PRAEFECT_VAR_ENV.env
+export PRAEFECT_LAUNCH_TEMPLATE_NAME=$PRAEFECT_LAUNCH_TEMPLATE_NAME | tee -a PRAEFECT_VAR_ENV.env
+export PRAEFECT_ASG_NAME=$PRAEFECT_ASG_NAME | tee -a PRAEFECT_VAR_ENV.env
+export PRAEFECT_TARGET_GROUP_NAME=$PRAEFECT_TARGET_GROUP_NAME | tee -a PRAEFECT_VAR_ENV.env
+
+source GITALY_VAR_ENV.env
+export DNS_NAME="inf.hogegecasa.com"
+export PRAEFECT_NAME="${ENV}-${PROJECT}-git-praefect"
+echo DNS_NAME=$DNS_NAME | tee -a GITALY_VAR_ENV.env
+echo PRAEFECT_NAME=$PRAEFECT_NAME | tee -a GITALY_VAR_ENV.env
+
+#####################################
+# 2. 現行Gitalyノード用のDNSレコードを削除
+#####################################
+PRIVATE_HOST_ZONE_JSON=$(aws route53 list-hosted-zones-by-name \
+  --dns-name $DNS_NAME \
+  --query 'HostedZones[].{Id:Id, Name:Name, PrivateZone:Config.PrivateZone}' \
+  --output json | jq '.[] | select(.PrivateZone == true)' | jq '@json')
+
+echo $PRIVATE_HOST_ZONE_JSON | jq '. | fromjson'
+
+
+PRIVATE_HOST_ZONE_ID=$(echo $PRIVATE_HOST_ZONE_JSON | jq '. | fromjson' | jq -r .Id)
+PRIVATE_HOST_ZONE_NAME=$(echo $PRIVATE_HOST_ZONE_JSON | jq '. | fromjson' | jq -r .Name)
+
+echo PRIVATE_HOST_ZONE_ID=$PRIVATE_HOST_ZONE_ID | tee -a GITALY_VAR_ENV.env
+echo PRIVATE_HOST_ZONE_NAME=$PRIVATE_HOST_ZONE_NAME | tee -a GITALY_VAR_ENV.env
+
+#現行（Blue）のGitalyのDNSレコードを取得
+BLUE_RECORD_IPS=($(aws route53 list-resource-record-sets \
+  --hosted-zone-id $PRIVATE_HOST_ZONE_ID \
+  --query "ResourceRecordSets[?contains(Name, 'gtlc-') && Type == 'A'].ResourceRecords[0].Value" \
+  --output text))
+
+BLUE_RECORD_IP_0=${BLUE_RECORD_IPS[0]}
+BLUE_RECORD_IP_1=${BLUE_RECORD_IPS[1]}
+BLUE_RECORD_IP_2=${BLUE_RECORD_IPS[2]}
+
+echo BLUE_RECORD_IP_0=$BLUE_RECORD_IP_0 | tee -a GITALY_VAR_ENV.env
+echo BLUE_RECORD_IP_1=$BLUE_RECORD_IP_1 | tee -a GITALY_VAR_ENV.env
+echo BLUE_RECORD_IP_2=$BLUE_RECORD_IP_2 | tee -a GITALY_VAR_ENV.env
+
+#Blueレコードの削除（gitlc-X）バッチJSON作成
+BLUE_RECORD_BATCH_JSON=$(cat <<EOF
+{
+  "Changes": [
+    {
+      "Action": "DELETE",
+      "ResourceRecordSet": {
+        "Name": "gtlc-0.${PRIVATE_HOST_ZONE_NAME}",
+        "Type": "A",
+        "TTL": 300,
+        "ResourceRecords": [
+          {
+            "Value": "$BLUE_RECORD_IP_0"
+          }
+        ]
+      }
+    },
+    {
+      "Action": "DELETE",
+      "ResourceRecordSet": {
+        "Name": "gtlc-1.${PRIVATE_HOST_ZONE_NAME}",
+        "Type": "A",
+        "TTL": 300,
+        "ResourceRecords": [
+          {
+            "Value": "$BLUE_RECORD_IP_1"
+          }
+        ]
+      }
+    },
+    {
+      "Action": "DELETE",
+      "ResourceRecordSet": {
+        "Name": "gtlc-2.${PRIVATE_HOST_ZONE_NAME}",
+        "Type": "A",
+        "TTL": 300,
+        "ResourceRecords": [
+          {
+            "Value": "$BLUE_RECORD_IP_2"
+          }
+        ]
+      }
+    }
+  ]
+}
+EOF
+)
+echo $BLUE_RECORD_BATCH_JSON | jq .
+
+#削除する前のDNSレコードを確認
+aws route53 list-resource-record-sets \
+  --hosted-zone-id $PRIVATE_HOST_ZONE_ID \
+  --query "ResourceRecordSets[?contains(Name, 'gtlc-') && Type=='A'].{Name:Name, IP:ResourceRecords[0].Value}" \
+  --output json
+
+#DNSレコード削除実行
+aws route53 change-resource-record-sets \
+  --hosted-zone-id $PRIVATE_HOST_ZONE_ID \
+  --change-batch "$BLUE_RECORD_BATCH_JSON"
+
+#削除した後のレコードの確認
+aws route53 list-resource-record-sets \
+  --hosted-zone-id $PRIVATE_HOST_ZONE_ID \
+  --query "ResourceRecordSets[?contains(Name, 'gtlc-') && Type=='A'].{Name:Name, IP:ResourceRecords[0].Value}" \
+  --output json
+
+#####################################
+# 3. 現行Gitalyインスタンスを削除
+#####################################
+#スケールイン実行前のインスタンス一覧確認
+ASG_ALL_INSTANCES_JSON=$(aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-name $GITALY_ASG_NAME \
+  --query 'AutoScalingGroups[0].Instances[].{InstanceId:InstanceId,LifecycleState:LifecycleState, Version:LaunchTemplate.Version}' \
+  --output json | jq '@json')
+echo $ASG_ALL_INSTANCES_JSON | jq '. | fromjson'
+
+#スケールイン実行（6 → 3）
+aws autoscaling update-auto-scaling-group \
+  --auto-scaling-group-name $GITALY_ASG_NAME \
+  --desired-capacity 3 \
+  --max-size 3
+
+#新インスタンス（新バージョンのテンプレート）だけが3個稼働（InService）になっていること確認
+ASG_ALL_INSTANCES_JSON=$(aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-name $GITALY_ASG_NAME \
+  --query 'AutoScalingGroups[0].Instances[].{InstanceId:InstanceId,LifecycleState:LifecycleState, Version:LaunchTemplate.Version}' \
+  --output json | jq '@json')
+echo $ASG_ALL_INSTANCES_JSON | jq '. | fromjson'
+
+#####################################
+# 4. 旧Gitalyノードへの接続エラーを確認
+#####################################
+#PraefectサーバのIPアドレスを取得
+PRAEFECT_INSTANCES_JSON=$(aws ec2 describe-instances \
+  --filters "Name=tag-key,Values=Name" \
+            "Name=tag-value,Values=$PRAEFECT_NAME" \
+            "Name=instance-state-name,Values=running" \
+  --query 'Reservations[].Instances[].{InstanceId:InstanceId, PrivateIpAddress:PrivateIpAddress}' \
+  --output json | jq '@json')
+echo $PRAEFECT_INSTANCES_JSON | jq '. | fromjson'
+
+#Linux版
+PRAEFECT_INSTANCES_IP=$(echo $PRAEFECT_INSTANCES_JSON | jq '. | fromjson' | jq -r'.[0].PrivateIpAddress')
+echo PRAEFECT_INSTANCES_IP=$PRAEFECT_INSTANCES_IP | tee -a GITALY_VAR_ENV.env
+
+#Windows版
+PRAEFECT_INSTANCES_IP=$(echo $PRAEFECT_INSTANCES_JSON | jq -r '. | fromjson | .[0].PrivateIpAddress')
+echo PRAEFECT_INSTANCES_IP=$PRAEFECT_INSTANCES_IP | tee -a GITALY_VAR_ENV.env
+
+
+ssh -i ../opsman-dev.pem vcap@$PRAEFECT_INSTANCE_IP
+
+sudo tail -f /var/log/gitlab/praefect/current
+
+GREEN_RECORD_BATCH_JSON=$(cat <<EOF
+{
+  "Changes": [
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "gtlc-0.${PRIVATE_HOST_ZONE_NAME}",
+        "Type": "A",
+        "TTL": 300,
+        "ResourceRecords": [
+          {
+            "Value": "$GREEN_INSTANCE_IP_0"
+          }
+        ]
+      }
+    },
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "gtlc-1.${PRIVATE_HOST_ZONE_NAME}",
+        "Type": "A",
+        "TTL": 300,
+        "ResourceRecords": [
+          {
+            "Value": "$GREEN_INSTANCE_IP_1"
+          }
+        ]
+      }
+    },
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "gtlc-2.${PRIVATE_HOST_ZONE_NAME}",
+        "Type": "A",
+        "TTL": 300,
+        "ResourceRecords": [
+          {
+            "Value": "$GREEN_INSTANCE_IP_2"
+          }
+        ]
+      }
+    }
+  ]
+}
+EOF
+)
+echo $GREEN_RECORD_BATCH_JSON | jq .
+
+#登録する前のDNSレコードを確認
+aws route53 list-resource-record-sets \
+  --hosted-zone-id $PRIVATE_HOST_ZONE_ID \
+  --query "ResourceRecordSets[?(contains(Name, 'gtlc-') && Type=='A')].{Name:Name, IP:ResourceRecords[0].Value}" \
+  --output table
+
+#DNSレコード登録実行
+aws route53 change-resource-record-sets \
+  --hosted-zone-id $PRIVATE_HOST_ZONE_ID \
+  --change-batch "$GREEN_RECORD_BATCH_JSON"
+
+#登録した後のレコードの確認
+aws route53 list-resource-record-sets \
+  --hosted-zone-id $PRIVATE_HOST_ZONE_ID \
+  --query "ResourceRecordSets[?(contains(Name, 'gtlc-') && Type=='A')].{Name:Name, IP:ResourceRecords[0].Value}"
+
+ssh -i ../opsman-dev.pem vcap@$PRAEFECT_INSTANCE_IP
+
+sudo tail -f /var/log/gitlab/praefect/current
