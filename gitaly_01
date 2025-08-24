@@ -1,0 +1,249 @@
+#####################################
+# 1. 環境変数
+#####################################
+export ENV="inf"
+export PROJECT="kish-code"
+export GITALY_LAUNCH_TEMPLATE_NAME="${ENV}-${PROJECT}-git-gitaly"
+export GITALY_ASG_NAME="${ENV}-${PROJECT}-git-gitaly"
+
+echo ENV=$ENV | tee -a GITALY_VAR_ENV.env
+echo PROJECT=$PROJECT | tee -a GITALY_VAR_ENV.env
+echo GITALY_LAUNCH_TEMPLATE_NAME=$GITALY_LAUNCH_TEMPLATE_NAME | tee -a GITALY_VAR_ENV.env
+echo GITALY_ASG_NAME=$GITALY_ASG_NAME | tee -a GITALY_VAR_ENV.env
+
+
+#####################################
+# 2. 起動テンプレートのアップデート
+#####################################
+#現在のGitalyの起動テンプレートを取得
+GITALY_LAUNCH_TEMPLATE_VERSION_JSON=$(aws ec2 describe-launch-templates \
+  --filters Name=launch-template-name,Values=${GITALY_LAUNCH_TEMPLATE_NAME}* \
+  --query 'LaunchTemplates[0].{LaunchTemplateId:LaunchTemplateId, DefaultVersionNumber:DefaultVersionNumber, LatestVersionNumber:LatestVersionNumber}' \
+  --output json | jq '@json')
+echo GITALY_LAUNCH_TEMPLATE_VERSION_JSON=$GITALY_LAUNCH_TEMPLATE_VERSION_JSON | tee -a GITALY_VAR_ENV.env
+
+#起動テンプレートのID、デフォルトVersion,現行Version取得変数化
+GITALY_LAUNCH_TEMPLATE_ID=$(echo $GITALY_LAUNCH_TEMPLATE_VERSION_JSON | jq '. | fromjson' | jq -r .LaunchTemplateId)
+GITALY_LAUNCH_TEMPLATE_DEFAULT_VERSION=$(echo $GITALY_LAUNCH_TEMPLATE_VERSION_JSON | jq '. | fromjson' | jq -r .DefaultVersionNumber)
+BLUE_GITALY_LAUNCH_TEMPLATE_VERSION=$(echo $GITALY_LAUNCH_TEMPLATE_VERSION_JSON | jq '. | fromjson' | jq -r .LatestVersionNumber)
+
+echo GITALY_LAUNCH_TEMPLATE_ID=$GITALY_LAUNCH_TEMPLATE_ID | tee -a GITALY_VAR_ENV.env
+echo GITALY_LAUNCH_TEMPLATE_DEFAULT_VERSION=$GITALY_LAUNCH_TEMPLATE_DEFAULT_VERSION | tee -a GITALY_VAR_ENV.env
+echo BLUE_GITALY_LAUNCH_TEMPLATE_VERSION=$BLUE_GITALY_LAUNCH_TEMPLATE_VERSION | tee -a GITALY_VAR_ENV.env
+
+#現行の起動テンプレートのUserDataを取得
+BLUE_GITALY_LAUNCH_TEMPLATE_JSON=$(aws ec2 describe-launch-template-versions \
+  --launch-template-id "$GITALY_LAUNCH_TEMPLATE_ID" \
+  --versions "$BLUE_GITALY_LAUNCH_TEMPLATE_VERSION" \
+  --query 'LaunchTemplateVersions[0].LaunchTemplateData.{ImageId:ImageId, UserData:UserData}' \
+  --output json | jq '@json')
+
+echo "BLUE_GITALY_LAUNCH_TEMPLATE_JSON=$BLUE_GITALY_LAUNCH_TEMPLATE_JSON" | tee -a GITALY_VAR_ENV.env
+
+#起動テンプレートテンプレートのAMIとUserDataを変数化
+BLUE_GITALY_LAUNCH_TEMPLATE_AMI=$(echo $BLUE_GITALY_LAUNCH_TEMPLATE_JSON | jq '. | fromjson' | jq -r .ImageId)
+BLUE_GITALY_LAUNCH_TEMPLATE_USER_DATA=$(echo $BLUE_GITALY_LAUNCH_TEMPLATE_JSON | jq '. | fromjson' | jq -r .UserData)
+
+echo BLUE_GITALY_LAUNCH_TEMPLATE_AMI=$BLUE_GITALY_LAUNCH_TEMPLATE_AMI | tee -a GITALY_VAR_ENV.env
+echo BLUE_GITALY_LAUNCH_TEMPLATE_USER_DATA=$BLUE_GITALY_LAUNCH_TEMPLATE_USER_DATA | tee -a GITALY_VAR_ENV.env
+
+#現行のUserDataのデコード結果をファイル出力
+echo $BLUE_GITALY_LAUNCH_TEMPLATE_USER_DATA | base64 -d > blue_gitaly_user_data_decode.txt
+cat blue_gitaly_user_data_decode.txt
+
+#新規用のテンプレートファイルを作成
+cp blue_gitaly_user_data_decode.txt green_gitaly_user_data_decode.txt
+
+#Gitlaのリポジトリパスを置換（AL2 → AL2023）
+sed -i -e 's#packages/amazon/2/gitlab-ee#packages/amazon/2023/gitlab-ee#g' green_gitaly_user_data_decode.txt
+sed -i -e 's#$GITLAB_VERSION-ee.0.amazon2.$ARCH.rpm#$GITLAB_VERSION-ee.0.amazon2023.$ARCH.rpm#g' green_gitaly_user_data_decode.txt
+
+#systemd 管理のサービスをcloud-initのあとに実行するようにGitlab構成
+sed -i -e "s#\(^prometheus\[.*\)#\1\npackage['systemd_after'] = 'cloud-final'#g" green_gitaly_user_data_decode.txt
+
+
+
+
+
+
+
+#deepsecurity アクティベートのため2
+#Deep Security Agent アクティベーション追加
+cat << 'EOF' >> green_gitaly_user_data_decode.txt
+#!/bin/bash
+exec > >(tee -a /var/log/dsa-activation.log) 2>&1
+echo "[INFO] Starting Deep Security Agent activation..."
+
+SETPOLICY=10
+SETDIR=/opt/ds_agent/
+SETURL="dsa_control -a dsm://agents.workload.jp-1.cloudone.trendmicro.com:443/ tenantID:59BF1FDF-93C7-286F-0B66-2972F15A5096 token:25EA1FE4-1DD1-6ABE-50E3-5CADCA52D5C2"
+
+SBID="S22067B001_management"
+GID_A=2265
+RLYID=3
+
+DSNAME=$(hostname)
+DISPLAY="${SBID}_${DSNAME}"
+ACTIVATIONURL="${SETDIR}${SETURL}"
+SETGROUPID=${GID_A}
+
+echo "ACTIVATIONURL=${ACTIVATIONURL}"
+echo "SETPOLICY=${SETPOLICY}"
+echo "RLYID=${RLYID}"
+echo "SETGROUPID=${SETGROUPID}"
+echo "DISPLAY=${DISPLAY}"
+
+rm -rf /tmp/ignore_agent_installer_check
+rm -rf /etc/use_dsa_with_iptables
+
+${SETDIR}dsa_control -r
+sleep 5
+
+touch /tmp/ignore_agent_installer_check
+eval ${ACTIVATIONURL} "policyid:${SETPOLICY}" "relaygroupid:${RLYID}" "groupid:${SETGROUPID}" "hostname:${DISPLAY}"
+
+touch /etc/use_dsa_with_iptables
+sleep 5
+
+# ユーザー追加
+useradd vcap
+mkdir -p /home/vcap/.ssh/
+echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC+WX6KbfSsYk3GajHUOeUiLZtpACsfp0oEipKajMp3hpzEXAsspc+rBgyRscngz0eV3/6AFyY2ANf++PMn1s6bBN3e/BYQpsDuKMGdoumsKwUEJYaCq2oGQHz2yZU2B9fjC17WE9ZTEL1nQbXsQ+jf8CDvQ+4bDmrfgYBlplG38tHPuvkzqBJ+pKlHfTu00ZQP4dEYf5NxKx7WOwkdRTzhkxxu8jVK1LI65JqFyIJzU9IpWKRbardLZFvzLJxbd8ftkC188D/lJTKTB+j+OeZk9Qs+FRVMiMgZ9RUg0aL2AosXlKAR0OeWWoCj3UcJZP8Ryx1hvBvdnsp37lHZ0KHLobHOpt30JNZBfNuul6srmmT7JHUL2lf+R+eYkwW17H6X8igHGAjE6DRnw+WBwrCy3UCsSh720GAR9yw9cNriI/Tjgn7d5SJXZpFyqbVplrKRx8NGt+OgsgaLUmNfzC99kC19jGq/1Sav2Advj3u9oVbO8wuG1XNeFH6Q1d9ETwYdTcYi5xS5ww1BFTT4XxbatWLyeObb9wlhj+0n+c30Eh8mReyXnWJqoI6gIAnTFYV7es+ph9V4gQnsJoZwHboE6jPIRdCurPxNHo2yUGRwc3SeWmeGbNgtDhGOQW6KZfHgiVgqMMW2nH+n4SHd7yjqCBDwhzKHxmXoyMa4uIcnFw== tanaka@SS-499" > /home/vcap/.ssh/authorized_keys
+chown vcap:vcap /home/vcap/.ssh/authorized_keys
+chown vcap:vcap /home/vcap/.ssh/
+chmod 600 /home/vcap/.ssh/authorized_keys
+chmod 700 /home/vcap/.ssh/
+usermod -aG wheel vcap
+echo "%wheel ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+EOF
+
+
+
+
+
+
+
+
+
+
+
+
+#修正した結果を表示
+cat green_gitaly_user_data_decode.txt
+
+#置換後のUserDataをエンコード
+GREEN_USER_DATA_ENCODE_UPDATE=$(cat green_gitaly_user_data_decode.txt | base64 -w 0)
+
+#新しい起動テンプレート用のAMIを取得
+NEW_AMI=$(aws ec2 describe-images \
+  --owners self \
+  --filters "Name=name,Values=*inf-kish-normal-image*" \
+  --query 'Images | sort_by(@, &CreationDate)[-1].ImageId' \
+  --output text)
+echo NEW_AMI=$NEW_AMI
+
+#更新内容JSON
+GREEN_TEMPLATE=$(cat << EOF
+{
+"ImageId": "$NEW_AMI",
+"UserData": "$GREEN_USER_DATA_ENCODE_UPDATE"
+}
+EOF
+)
+GREEN_LAUNCH_TEMPLATE_DATA=$(echo $GREEN_TEMPLATE | jq -c)
+echo $GREEN_LAUNCH_TEMPLATE_DATA
+
+#起動テンプレート差分更新実行
+aws ec2 create-launch-template-version \
+  --launch-template-id $GITALY_LAUNCH_TEMPLATE_ID \
+  --version-description "OS lmage change from AL2 to AL2023" \
+  --source-version $BLUE_GITALY_LAUNCH_TEMPLATE_VERSION \
+  --launch-template-data "$GREEN_LAUNCH_TEMPLATE_DATA" \
+  --query "LaunchTemplateVersion.VersionNumber" \
+  --output text
+
+#更新後のGitalyの起動テンプレートを取得
+GREEN_LAUNCH_TEMPLATE_VERSION_JSON=$(aws ec2 describe-launch-templates \
+  --filters Name=launch-template-name,Values=${GITALY_LAUNCH_TEMPLATE_NAME}* \
+  --query 'LaunchTemplates[0].{LaunchTemplateId:LaunchTemplateId,DefaultVersionNumber:DefaultVersionNumber,LatestVersionNumber:LatestVersionNumber}' \
+  --output json | jq '@json')
+echo GREEN_LAUNCH_TEMPLATE_VERSION_JSON=$GREEN_LAUNCH_TEMPLATE_VERSION_JSON | tee -a GITALY_VAR_ENV.env
+
+GREEN_LAUNCH_TEMPLATE_LATEST_VERSION=$(echo $GREEN_LAUNCH_TEMPLATE_VERSION_JSON | jq '. | fromjson' | jq -r .LatestVersionNumber)
+echo GREEN_LAUNCH_TEMPLATE_LATEST_VERSION=$GREEN_LAUNCH_TEMPLATE_LATEST_VERSION
+
+#Gitlayの起動テンプレートのデフォルトVersionを最新Versionに設定
+aws ec2 modify-launch-template \
+  --launch-template-id $GITALY_LAUNCH_TEMPLATE_ID \
+  --default-version $GREEN_LAUNCH_TEMPLATE_LATEST_VERSION
+
+#現行のAutoScalingGroupが使用するテンプレートVersionを確認
+BLUE_ASG_TEMPLATE_VERSION=$(aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-name $GITALY_ASG_NAME \
+  --query 'AutoScalingGroups[0].LaunchTemplate.Version' \
+  --output text)
+echo BLUE_ASG_TEMPLATE_VERSION=$BLUE_ASG_TEMPLATE_VERSION
+
+#AutoScalingGroupが使用するテンプレートVersionを最新のテンプレートのVersionに変更
+aws autoscaling update-auto-scaling-group \
+  --auto-scaling-group-name $GITALY_ASG_NAME \
+  --launch-template LaunchTemplateId=$GITALY_LAUNCH_TEMPLATE_ID,Version=$GREEN_LAUNCH_TEMPLATE_LATEST_VERSION
+
+#変更後のAutoScalingGroupが使用するテンプレートVersionを確認
+GREEN_ASG_TEMPLATE_VERSION=$(aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-name $GITALY_ASG_NAME \
+  --query 'AutoScalingGroups[0].LaunchTemplate.Version' \
+  --output text)
+echo GREEN_ASG_TEMPLATE_VERSION=$GREEN_ASG_TEMPLATE_VERSION
+
+#スケールアウト実行前のインスタンス一覧確認
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-name $GITALY_ASG_NAME \
+  --query 'AutoScalingGroups[0].Instances[].{InstanceId:InstanceId,LifecycleState:LifecycleState, Version:LaunchTemplate.Version}' \
+  --output json
+
+#スケールアウト実行（2倍に拡張）
+aws autoscaling update-auto-scaling-group \
+  --auto-scaling-group-name $GITALY_ASG_NAME \
+  --desired-capacity 6 \
+  --max-size 6
+
+#新インスタンス（新バージョンのテンプレート）が2倍に増え & 稼働中（InService）になるまで待機
+ALL_ASG_INSTANCES_JSON=$(aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-name $GITALY_ASG_NAME \
+  --query 'AutoScalingGroups[0].Instances[].{InstanceId:InstanceId,LifecycleState:LifecycleState, Version:LaunchTemplate.Version}' \
+  --output json | jq '@json')
+echo $ALL_ASG_INSTANCES_JSON | jq '. | fromjson'
+
+#Auto Scaling Group）のインスタンスの中から、特定条件に合うインスタンス ID を抽出して配列に格納 する
+#Linux用
+GREEN_INSTANCE_IDS=($(echo $ALL_ASG_INSTANCES_JSON | jq '. | fromjson' | jq ".[] | select(.Version == \"$GREEN_LAUNCH_TEMPLATE_LATEST_VERSION\" and .LifecycleState == \"InService\")" | jq -r .InstanceId))
+#Windows用
+GREEN_INSTANCE_IDS=($(echo "$ALL_ASG_INSTANCES_JSON" | jq -r '. | fromjson | map(select(.Version == "'"$GREEN_LAUNCH_TEMPLATE_LATEST_VERSION"'" and .LifecycleState=="InService")) | .[].InstanceId' | tr -d '\r'))
+
+GREEN_INSTANCE_ID_0=${GREEN_INSTANCE_IDS[0]}
+GREEN_INSTANCE_ID_1=${GREEN_INSTANCE_IDS[1]}
+GREEN_INSTANCE_ID_2=${GREEN_INSTANCE_IDS[2]}
+echo GREEN_INSTANCE_ID_0=$GREEN_INSTANCE_ID_0 | tee -a GITALY_VAR_ENV.env
+echo GREEN_INSTANCE_ID_1=$GREEN_INSTANCE_ID_1 | tee -a GITALY_VAR_ENV.env
+echo GREEN_INSTANCE_ID_2=$GREEN_INSTANCE_ID_2 | tee -a GITALY_VAR_ENV.env
+
+GREEN_INSTANCES_JSON=$(aws ec2 describe-instances \
+  --instance-ids $GREEN_INSTANCE_ID_0 $GREEN_INSTANCE_ID_1 $GREEN_INSTANCE_ID_2 \
+  --query 'Reservations[].Instances[].{InstanceId:InstanceId, PrivateIpAddress:PrivateIpAddress}' \
+  --output json | jq '@json')
+echo $GREEN_INSTANCES_JSON | jq '. | fromjson'
+
+GREEN_INSTANCE_IP_0=$(echo $GREEN_INSTANCES_JSON | jq '. | fromjson' | jq -r '.[0].PrivateIpAddress')
+GREEN_INSTANCE_IP_1=$(echo $GREEN_INSTANCES_JSON | jq '. | fromjson' | jq -r '.[1].PrivateIpAddress')
+GREEN_INSTANCE_IP_2=$(echo $GREEN_INSTANCES_JSON | jq '. | fromjson' | jq -r '.[2].PrivateIpAddress')
+echo GREEN_INSTANCE_IP_0=$GREEN_INSTANCE_IP_0 | tee -a GITALY_VAR_ENV.env
+echo GREEN_INSTANCE_IP_1=$GREEN_INSTANCE_IP_1 | tee -a GITALY_VAR_ENV.env
+echo GREEN_INSTANCE_IP_2=$GREEN_INSTANCE_IP_2 | tee -a GITALY_VAR_ENV.env
+
+
+GREEN_INSTANCE_IP=$GREEN_INSTANCE_IP_0
+
+ssh -i ../opsman-dev.pem vcap@$GREEN_INSTANCE_IP_0
+
+sudo tail -f /var/log/cloud-init-output.log
