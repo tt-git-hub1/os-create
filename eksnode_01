@@ -1,0 +1,180 @@
+■EKS Node
+補足：
+EKS Node 2023は２つの要素がある（EKSの接続とSSHの鍵とアクティベート）からyamlみたいな記述
+置換しないで全く新規のuserdataファイルを入れて更新する（praefectとgitalyは変えるところを一部だったからファイルのバージョン等）
+nodeはal2とal2023では書き方が全然違うから全とっかえ、現行の起動テンプレートから取得して等はしない
+node_group-2025082110235649690000000a
+
+#手順の流れ
+EKSバージョンアップでしたNodeGroupのバージョンアップ手順をベース
+
+↓
+
+ベース手順 ＋ UserDataファイルを新しく作成してそのUserDataにdeepsecurityのアクティベートシェルを入れる
+
+↓
+
+バージョンアップ
+
+
+
+■Praefect,Gitaly
+補足：Userdataの内容は普通のshellの書き方でいい 
+
+金曜日にした作業はyamlみたいな記述なのでshellの書き方で作成してみる
+
+
+
+#####################################
+# 1. 環境変数
+#####################################
+export ENV="inf"
+export PROJECT="kish-code"
+export EKS_CLUSTER_NAME="${ENV}-${PROJECT}-eks"
+export PROJECT_CLUSTER_NAME="kish-code-eks"
+ROLE_ARN=arn:aws:iam::405501939914:role/"${ENV}-${PROJECT}-eks-shell-role"
+export NODE_GROUP_NAME="inf-kish-code-ng-2025082110240262180000000c"
+
+export EKS_VERSION="1.31"
+export EKS_NODE_AMI_PARAMETER_PATH=
+export TEMPLATE_VERSION_DESCRIPTION="Update Version to EKS v${EKS_VERSION}"
+
+
+#####################################
+# 2. クラスターに接続
+#####################################
+aws eks update-kubeconfig --name ${EKS_CLUSTER_NAME} \
+  --role arn:aws:iam::405501939914:role/inf-kish-code-eks-shell-role
+
+CLUSTER_ARN=$(aws eks describe-cluster --name ${EKS_CLUSTER_NAME} \
+  --query cluster.arn \
+  --output text)
+echo CLUSTER_ARN=$CLUSTER_ARN
+
+kubectl config set-context $CLUSTER_ARN
+kubectl config current-context
+
+#####################################
+# 2. クラスターに接続
+#####################################
+#使用されている起動テンプレートのIDとバージョンを取得
+NODEGROUP_JSON=$(aws eks describe-nodegroup \
+  --cluster-name $EKS_CLUSTER_NAME \
+  --nodegroup-name $NODE_GROUP_NAME \
+  --query "nodegroup.launchTemplate" \
+  --output json)
+NODEGROUP_LAUNCHTEMPLATE_ID=$(echo $NODEGROUP_JSON | jq -r ".id")
+NODEGROUP_LAUNCHTEMPLATE_VERSION=$(echo $NODEGROUP_JSON | jq -r ".version")
+echo NODEGROUP_LAUNCHTEMPLATE_ID=$NODEGROUP_LAUNCHTEMPLATE_ID
+echo NODEGROUP_LAUNCHTEMPLATE_VERSION=$NODEGROUP_LAUNCHTEMPLATE_VERSION
+
+# 新しい起動テンプレート用のAMIを取得
+AMI_ID=$(aws ec2 describe-images \
+  --owners self \
+  --filters "Name=name,Values=*inf-kish-eks-image*" \
+  --query 'Images | sort_by(@, &CreationDate)[-1].ImageId' \
+  --output text)
+echo AMI_ID=$AMI_ID
+
+#
+cat << 'EOF' >> eks_user_data_decode.txt
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="//"
+
+--//
+Content-Type: application/node.eks.aws
+
+apiVersion: node.eks.aws/v1alpha1
+kind: NodeConfig
+spec:
+  cluster:
+    name: inf-kish-code-eks
+    apiServerEndpoint: https://6C666C5897CD1BBFC37644F16909444F.gr7.ap-northeast-1.eks.amazonaws.com
+    certificateAuthority: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURCVENDQWUyZ0F3SUJBZ0lJZngvcWFjQUlIbnN3RFFZSktvWklodmNOQVFFTEJRQXdGVEVUTUJFR0ExVUUKQXhNS2EzVmlaWEp1WlhSbGN6QWVGdzB5TlRBNE1qRXhNREUwTXpGYUZ3MHpOVEE0TVRreE1ERTVNekZhTUJVeApFekFSQmdOVkJBTVRDbXQxWW1WeWJtVjBaWE13Z2dFaU1BMEdDU3FHU0liM0RRRUJBUVVBQTRJQkR3QXdnZ0VLCkFvSUJBUURRZjhZNTdBRmZpZW1vRlI5S3VQU2lQRFFobkF4ZzEzNkR1dzdWRnp0T2ZQekI3RmdEcWpZbisyaWsKZGcyeTZWb0ZDMklSaDVVbzlRbzBIVktkOXppV3F4QjhqYWxXYXNJdTVxYnNnanZ5UVNORG1XMmxGenhyV2lvaApOT3NHaktQdGN2YUllMTgyYjlYd2ZNUlhvY21MVGd5T3JuOEtKaXZsOCtiOEh1b2VZMm8rVUJUME1JMUo5OU9IClZMTVByY0ViQ3NOZE53YW9UbCtVRzZlMXNzNy9FYUFkRGpHZy9NMVlsbWFvb1NBaUEweDNjeGJIcDBGckRyc2wKa2xncGZDQi9ZZEJibEs3cUlsTzh5WE9oVXJOWG4rZ1Z5dmRUTk5YWU1ZUyt5OXA5RWpOVGRkMml2SXV5dmhFQworZ2I3Qk9oVFZSWXRabEtOMTM0QVBQc0xVMmFMQWdNQkFBR2pXVEJYTUE0R0ExVWREd0VCL3dRRUF3SUNwREFQCkJnTlZIUk1CQWY4RUJUQURBUUgvTUIwR0ExVWREZ1FXQkJSaXhMZ0hzUHNvSVV4NHVFSjdqUzhzUWs0NEVqQVYKQmdOVkhSRUVEakFNZ2dwcmRXSmxjbTVsZEdWek1BMEdDU3FHU0liM0RRRUJDd1VBQTRJQkFRQWNyK2Z1VzcwTwpjSUFoYUtrWitQdmtyRitRY2JUNVcrK3AvbGhleVpxdlc3alpoUGJNYUdEcXFXVGxBREFDaEZhYXZnUVNqR3lvCldscFp2WUlFZWZkRXhKWDUxUng1Qk5kd1pWa1gwWXErR0ZTOUU1QzIvYlhERnl4b0tYVUFaeTZQVnVCdUp3RDQKTGxCZUYzTFJJOEtKcnM2Tk1MVFJVUFJWSVBwY1hVNGVIc2ZmcTR4OVUvSWhwK29VZlpaNE1FWGRQNHprRWxTVQpwMCtNNW8wMjJ3Wkk5RkJRQTQ3ZkZJOTlQYXdiaVNBWE1US2xOS0hzRWUwMEdWVE9GbUI2WVl2bGhJcEZxM2EzCjM5cFBMdnNYVEhLL3ZtU0J1S0xtNjdNNjVZK2tucWtaMmg1dFVndlJDRmZjU2tuQmNkWU9RZ3FocWw3dS9GdGsKSTZ1TFpkazQvbmVwCi0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K
+    cidr: 172.20.0.0/16
+  kubelet:
+    config:
+      maxPods: 50
+
+--//
+Content-Type: text/x-shellscript; charset="us-ascii"
+
+#!/bin/bash
+exec > >(tee -a /var/log/dsa-activation.log) 2>&1
+echo "[INFO] Starting Deep Security Agent activation..."
+
+SETPOLICY=10
+SETDIR=/opt/ds_agent/
+SETURL="dsa_control -a dsm://agents.workload.jp-1.cloudone.trendmicro.com:443/ tenantID:59BF1FDF-93C7-286F-0B66-2972F15A5096 token:25EA1FE4-1DD1-6ABE-50E3-5CADCA52D5C2"
+
+SBID="S22067B001_management"
+GID_A=2265
+RLYID=3
+
+DSNAME=$(hostname)
+DISPLAY="${SBID}_${DSNAME}"
+ACTIVATIONURL="${SETDIR}${SETURL}"
+SETGROUPID=${GID_A}
+
+echo "ACTIVATIONURL=${ACTIVATIONURL}"
+echo "SETPOLICY=${SETPOLICY}"
+echo "RLYID=${RLYID}"
+echo "SETGROUPID=${SETGROUPID}"
+echo "DISPLAY=${DISPLAY}"
+
+rm -rf /tmp/ignore_agent_installer_check
+rm -rf /etc/use_dsa_with_iptables
+
+${SETDIR}dsa_control -r
+sleep 5
+
+touch /tmp/ignore_agent_installer_check
+eval ${ACTIVATIONURL} "policyid:${SETPOLICY}" "relaygroupid:${RLYID}" "groupid:${SETGROUPID}" "hostname:${DISPLAY}"
+
+touch /etc/use_dsa_with_iptables
+sleep 5
+
+useradd vcap
+mkdir -p /home/vcap/.ssh/
+echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC+WX6KbfSsYk3GajHUOeUiLZtpACsfp0oEipKajMp3hpzEXAsspc+rBgyRscngz0eV3/6AFyY2ANf++PMn1s6bBN3e/BYQpsDuKMGdoumsKwUEJYaCq2oGQHz2yZU2B9fjC17WE9ZTEL1nQbXsQ+jf8CDvQ+4bDmrfgYBlplG38tHPuvkzqBJ+pKlHfTu00ZQP4dEYf5NxKx7WOwkdRTzhkxxu8jVK1LI65JqFyIJzU9IpWKRbardLZFvzLJxbd8ftkC188D/lJTKTB+j+OeZk9Qs+FRVMiMgZ9RUg0aL2AosXlKAR0OeWWoCj3UcJZP8Ryx1hvBvdnsp37lHZ0KHLobHOpt30JNZBfNuul6srmmT7JHUL2lf+R+eYkwW17H6X8igHGAjE6DRnw+WBwrCy3UCsSh720GAR9yw9cNriI/Tjgn7d5SJXZpFyqbVplrKRx8NGt+OgsgaLUmNfzC99kC19jGq/1Sav2Advj3u9oVbO8wuG1XNeFH6Q1d9ETwYdTcYi5xS5ww1BFTT4XxbatWLyeObb9wlhj+0n+c30Eh8mReyXnWJqoI6gIAnTFYV7es+ph9V4gQnsJoZwHboE6jPIRdCurPxNHo2yUGRwc3SeWmeGbNgtDhGOQW6KZfHgiVgqMMW2nH+n4SHd7yjqCBDwhzKHxmXoyMa4uIcnFw== tanaka@SS-499" > /home/vcap/.ssh/authorized_keys
+chown vcap:vcap /home/vcap/.ssh/authorized_keys
+chown vcap:vcap /home/vcap/.ssh/
+chmod 600 /home/vcap/.ssh/authorized_keys
+chmod 700 /home/vcap/.ssh/
+usermod -aG wheel vcap
+echo "%wheel ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+--//--
+EOF
+
+#置換後のUserDataをエンコード
+EKS_USER_DATA_BASE64=$(cat eks_user_data_decode.txt | base64 -w 0)
+
+# JSONファイルを作成し新しいAMI IDを指定
+cat << EOF > version-up-launch-template-config.json
+{
+  "ImageId": "$AMI_ID",
+  "UserData": "$EKS_USER_DATA_BASE64"
+}
+EOF
+cat version-up-launch-template-config.json
+
+# 既存テンプレートの設定を流用し、新しいAMIでテンプレートバージョンを作成
+NEW_TEMPLATE_VERSION=$(aws ec2 create-launch-template-version \
+  --launch-template-id ${NODEGROUP_LAUNCHTEMPLATE_ID} \
+  --version-description "${TEMPLATE_VERSION_DESCRIPTION}" \
+  --source-version ${NODEGROUP_LAUNCHTEMPLATE_VERSION} \
+  --launch-template-data file://version-up-launch-template-config.json \
+  --query LaunchTemplateVersion.VersionNumber \
+  --output text)
+echo NEW_TEMPLATE_VERSION=$NEW_TEMPLATE_VERSION
+
+# NodeGroupのテンプレートを変更（新しいEKS VersionのAMI）
+aws eks update-nodegroup-version \
+  --cluster-name ${EKS_CLUSTER_NAME} \
+  --nodegroup-name ${NODE_GROUP_NAME} \
+  --launch-template id=${NODEGROUP_LAUNCHTEMPLATE_ID},version=${NEW_TEMPLATE_VERSION}
+
+watch kubectl get node
+
+kubectl get pod -A
